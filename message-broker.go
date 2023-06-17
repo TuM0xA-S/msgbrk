@@ -2,6 +2,7 @@ package main
 
 import (
 	"container/list"
+	"context"
 	"errors"
 	"log"
 	"net/http"
@@ -12,9 +13,8 @@ import (
 )
 
 // !!!DISCLAIMER!!!
-// это второй вариант
-// вначале я начал делать ультрасложную херь потом покажу мне интересно как заставить её работать
-
+// третий вариант с использованием контекста на ожидании (решает проблему когда ожидающий запрос отменяется)
+// убирание буферизации с канала отправки на войтере чтобы когда ожидание закончилось не было варианта послать туда когда сработал таймер
 // max queue size
 // billion is ok and pretty practical
 // unsafe.Sizeof([]byte{}) == 24
@@ -26,7 +26,6 @@ var (
 	ErrorWaitersOverflow = errors.New("waiters overflow")
 	ErrorNoMessage       = errors.New("no message")
 )
-
 
 type MessageBroker struct {
 	ts map[string]Topic
@@ -47,23 +46,12 @@ func NewTopic() Topic {
 }
 
 type Waiter struct {
-	ch      chan []byte
-	timeout <-chan struct{}
+	ch  chan []byte
+	ctx context.Context
 }
 
-// CloseTimer closes channel after at least t time
-// it needed to safely wait in multiple points
-func NewCloseTimer(t time.Duration) <-chan struct{} {
-	ch := make(chan struct{})
-	go func() {
-		time.Sleep(t)
-		close(ch)
-	}()
-
-	return ch
-}
-func NewWaiter(t time.Duration) Waiter {
-	return Waiter{ch: make(chan []byte, 1), timeout: NewCloseTimer(t)}
+func NewWaiter(ctx context.Context) Waiter {
+	return Waiter{ch: make(chan []byte), ctx: ctx}
 }
 
 func NewMessageBroker() *MessageBroker {
@@ -82,13 +70,13 @@ func (mb *MessageBroker) Publish(topic string, msg []byte) error {
 		w := t.waiters.Remove(t.waiters.Front()).(Waiter)
 		// if waiter timeouted try next waiter
 		// if we have timeout waiter have timeout too
-		// if we sended message water get message
+		// if we sended message waiter get message because channel is unbuffered
 		// sender and waiter literally waiting on same select
 		// гонки данных нет твердо и четко (?)
 		select {
 		case w.ch <- msg:
 			return nil
-		case <-w.timeout:
+		case <-w.ctx.Done():
 		}
 	}
 	// if no waiter push to queue
@@ -103,7 +91,7 @@ func (mb *MessageBroker) Publish(topic string, msg []byte) error {
 
 // Consume with timeout, return msg and if consumed ok
 // timeout <= 0 means do no wait for value
-func (mb *MessageBroker) Consume(topic string, timeout time.Duration) ([]byte, error) {
+func (mb *MessageBroker) Consume(ctx context.Context, topic string, timeout time.Duration) ([]byte, error) {
 	mb.mu.Lock()
 	// if no topic then create
 	if _, ok := mb.ts[topic]; !ok {
@@ -126,14 +114,16 @@ func (mb *MessageBroker) Consume(topic string, timeout time.Duration) ([]byte, e
 		mb.mu.Unlock()
 		return nil, ErrorWaitersOverflow
 	}
-	w := NewWaiter(timeout)
+	ctxTimeout, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	w := NewWaiter(ctxTimeout)
 	t.waiters.PushBack(w)
 	mb.mu.Unlock()
 
 	select {
 	case msg := <-w.ch:
 		return msg, nil
-	case <-w.timeout:
+	case <-w.ctx.Done():
 		return nil, ErrorNoMessage
 	}
 }
@@ -185,7 +175,7 @@ func (s *Service) consume(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 	topic := req.URL.Path
-	msg, err := s.mb.Consume(topic, time.Duration(timeout)*time.Second)
+	msg, err := s.mb.Consume(req.Context(), topic, time.Duration(timeout)*time.Second)
 	if err == ErrorNoMessage {
 		rw.WriteHeader(http.StatusNotFound)
 		return
