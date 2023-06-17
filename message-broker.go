@@ -68,11 +68,8 @@ func (mb *MessageBroker) Publish(topic string, msg []byte) error {
 	t := mb.ts[topic]
 	for t.waiters.Len() > 0 {
 		w := t.waiters.Remove(t.waiters.Front()).(Waiter)
-		// if waiter timeouted try next waiter
-		// if we have timeout waiter have timeout too
-		// if we sended message waiter get message because channel is unbuffered
-		// sender and waiter literally waiting on same select
-		// гонки данных нет твердо и четко (?)
+		// we send message only if waiter not timeouted
+		// гонки данных нет твердо и четко (!)
 		select {
 		case w.ch <- msg:
 			return nil
